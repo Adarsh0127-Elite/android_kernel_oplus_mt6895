@@ -11,6 +11,7 @@ struct net_device;
 struct sk_buff;
 struct sock;
 struct net;
+
 /* *** ANDROID FIXUP ***
  * These typedefs are used to help fixup the ABI break caused by commit
  * 92f1655aa2b2 ("net: fix __dst_negative_advice() race") where the

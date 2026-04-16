@@ -263,8 +263,6 @@ extern void release_thread(struct task_struct *);
 
 unsigned long get_wchan(struct task_struct *p);
 
-unsigned long get_backtrace(struct task_struct *p, int i);
-
 void update_sctlr_el1(u64 sctlr);
 
 /* Thread switching */

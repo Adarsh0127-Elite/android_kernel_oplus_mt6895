@@ -177,23 +177,15 @@ static inline void z_erofs_onlinepage_endio(struct page *page)
 	if (!(v & Z_EROFS_ONLINEPAGE_COUNT_MASK)) {
 		set_page_private(page, 0);
 		ClearPagePrivate(page);
-
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-		if (PageCont(page)) {
-			set_cont_pte_uptodate_and_unlock(page);
-		} else
-#endif
-		{
-			if (!PageError(page))
-				SetPageUptodate(page);
-			unlock_page(page);
-		}
+		if (!PageError(page))
+			SetPageUptodate(page);
+		unlock_page(page);
 	}
 	erofs_dbg("%s, page %p value %x", __func__, page, atomic_read(u.o));
 }
 
 #define Z_EROFS_VMAP_ONSTACK_PAGES	\
-	min_t(unsigned int, THREAD_SIZE / 8 / sizeof(struct page *), 96U)
+	MIN_T(unsigned int, THREAD_SIZE / 8 / sizeof(struct page *), 96U)
 #define Z_EROFS_VMAP_GLOBAL_PAGES	2048
 
 #endif

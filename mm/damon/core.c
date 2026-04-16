@@ -17,84 +17,13 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/damon.h>
 
+#ifdef CONFIG_DAMON_KUNIT_TEST
+#undef DAMON_MIN_REGION
+#define DAMON_MIN_REGION 1
+#endif
+
 static DEFINE_MUTEX(damon_lock);
 static int nr_running_ctxs;
-static bool running_exclusive_ctxs;
-
-static DEFINE_MUTEX(damon_ops_lock);
-static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
-
-static unsigned long last_metric;
-static unsigned long active_interval;
-static unsigned long active_cnt;
-
-extern int wmarks_metric;
-extern unsigned long nr_reclaim_time;
-extern unsigned long nr_reclaim_page;
-extern unsigned long nr_damon_region;
-
-/* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
-static bool damon_registered_ops_id(enum damon_ops_id id)
-{
-	struct damon_operations empty_ops = {};
-
-	if (!memcmp(&empty_ops, &damon_registered_ops[id], sizeof(empty_ops)))
-		return false;
-	return true;
-}
-
-/**
- * damon_register_ops() - Register a monitoring operations set to DAMON.
- * @ops:	monitoring operations set to register.
- *
- * This function registers a monitoring operations set of valid &struct
- * damon_operations->id so that others can find and use them later.
- *
- * Return: 0 on success, negative error code otherwise.
- */
-int damon_register_ops(struct damon_operations *ops)
-{
-	int err = 0;
-
-	if (ops->id >= NR_DAMON_OPS)
-		return -EINVAL;
-	mutex_lock(&damon_ops_lock);
-	/* Fail for already registered ops */
-	if (damon_registered_ops_id(ops->id)) {
-		err = -EINVAL;
-		goto out;
-	}
-	damon_registered_ops[ops->id] = *ops;
-out:
-	mutex_unlock(&damon_ops_lock);
-	return err;
-}
-
-/**
- * damon_select_ops() - Select a monitoring operations to use with the context.
- * @ctx:	monitoring context to use the operations.
- * @id:		id of the registered monitoring operations to select.
- *
- * This function finds registered monitoring operations set of @id and make
- * @ctx to use it.
- *
- * Return: 0 on success, negative error code otherwise.
- */
-int damon_select_ops(struct damon_ctx *ctx, enum damon_ops_id id)
-{
-	int err = 0;
-
-	if (id >= NR_DAMON_OPS)
-		return -EINVAL;
-
-	mutex_lock(&damon_ops_lock);
-	if (!damon_registered_ops_id(id))
-		err = -EINVAL;
-	else
-		ctx->ops = damon_registered_ops[id];
-	mutex_unlock(&damon_ops_lock);
-	return err;
-}
 
 /*
  * Construct a damon_region struct
@@ -215,7 +144,7 @@ void damon_destroy_scheme(struct damos *s)
  *
  * Returns the pointer to the new struct if success, or NULL otherwise
  */
-struct damon_target *damon_new_target(void)
+struct damon_target *damon_new_target(unsigned long id)
 {
 	struct damon_target *t;
 
@@ -223,7 +152,7 @@ struct damon_target *damon_new_target(void)
 	if (!t)
 		return NULL;
 
-	t->pid = NULL;
+	t->id = id;
 	t->nr_regions = 0;
 	INIT_LIST_HEAD(&t->regions_list);
 	INIT_LIST_HEAD(&t->list);
@@ -276,10 +205,10 @@ struct damon_ctx *damon_new_ctx(void)
 
 	ctx->sample_interval = 5 * 1000;
 	ctx->aggr_interval = 100 * 1000;
-	ctx->ops_update_interval = 60 * 1000 * 1000;
+	ctx->primitive_update_interval = 60 * 1000 * 1000;
 
 	ktime_get_coarse_ts64(&ctx->last_aggregation);
-	ctx->last_ops_update = ctx->last_aggregation;
+	ctx->last_primitive_update = ctx->last_aggregation;
 
 	mutex_init(&ctx->kdamond_lock);
 
@@ -296,8 +225,8 @@ static void damon_destroy_targets(struct damon_ctx *ctx)
 {
 	struct damon_target *t, *next_t;
 
-	if (ctx->ops.cleanup) {
-		ctx->ops.cleanup(ctx);
+	if (ctx->primitive.cleanup) {
+		ctx->primitive.cleanup(ctx);
 		return;
 	}
 
@@ -318,11 +247,43 @@ void damon_destroy_ctx(struct damon_ctx *ctx)
 }
 
 /**
+ * damon_set_targets() - Set monitoring targets.
+ * @ctx:	monitoring context
+ * @ids:	array of target ids
+ * @nr_ids:	number of entries in @ids
+ *
+ * This function should not be called while the kdamond is running.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_set_targets(struct damon_ctx *ctx,
+		      unsigned long *ids, ssize_t nr_ids)
+{
+	ssize_t i;
+	struct damon_target *t, *next;
+
+	damon_destroy_targets(ctx);
+
+	for (i = 0; i < nr_ids; i++) {
+		t = damon_new_target(ids[i]);
+		if (!t) {
+			/* The caller should do cleanup of the ids itself */
+			damon_for_each_target_safe(t, next, ctx)
+				damon_destroy_target(t);
+			return -ENOMEM;
+		}
+		damon_add_target(ctx, t);
+	}
+
+	return 0;
+}
+
+/**
  * damon_set_attrs() - Set attributes for the monitoring.
  * @ctx:		monitoring context
  * @sample_int:		time interval between samplings
  * @aggr_int:		time interval between aggregations
- * @ops_upd_int:	time interval between monitoring operations updates
+ * @primitive_upd_int:	time interval between monitoring primitive updates
  * @min_nr_reg:		minimal number of regions
  * @max_nr_reg:		maximum number of regions
  *
@@ -332,18 +293,17 @@ void damon_destroy_ctx(struct damon_ctx *ctx)
  * Return: 0 on success, negative error code otherwise.
  */
 int damon_set_attrs(struct damon_ctx *ctx, unsigned long sample_int,
-		    unsigned long aggr_int, unsigned long ops_upd_int,
+		    unsigned long aggr_int, unsigned long primitive_upd_int,
 		    unsigned long min_nr_reg, unsigned long max_nr_reg)
 {
 	if (min_nr_reg < 3)
 		return -EINVAL;
-
 	if (min_nr_reg > max_nr_reg)
 		return -EINVAL;
 
 	ctx->sample_interval = sample_int;
 	ctx->aggr_interval = aggr_int;
-	ctx->ops_update_interval = ops_upd_int;
+	ctx->primitive_update_interval = primitive_upd_int;
 	ctx->min_nr_regions = min_nr_reg;
 	ctx->max_nr_regions = max_nr_reg;
 
@@ -404,6 +364,7 @@ static unsigned long damon_region_sz_limit(struct damon_ctx *ctx)
 		sz /= ctx->min_nr_regions;
 	if (sz < DAMON_MIN_REGION)
 		sz = DAMON_MIN_REGION;
+
 	return sz;
 }
 
@@ -440,24 +401,22 @@ static int __damon_start(struct damon_ctx *ctx)
  * damon_start() - Starts the monitorings for a given group of contexts.
  * @ctxs:	an array of the pointers for contexts to start monitoring
  * @nr_ctxs:	size of @ctxs
- * @exclusive:	exclusiveness of this contexts group
+ *
  * This function starts a group of monitoring threads for a group of monitoring
  * contexts.  One thread per each context is created and run in parallel.  The
- * caller should handle synchronization between the threads by itself.  If
- * @exclusive is true and a group of threads that created by other
- * 'damon_start()' call is currently running, this function does nothing but
- * returns -EBUSY.
+ * caller should handle synchronization between the threads by itself.  If a
+ * group of threads that created by other 'damon_start()' call is currently
+ * running, this function does nothing but returns -EBUSY.
  *
  * Return: 0 on success, negative error code otherwise.
  */
-int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
+int damon_start(struct damon_ctx **ctxs, int nr_ctxs)
 {
 	int i;
 	int err = 0;
 
 	mutex_lock(&damon_lock);
-	if ((exclusive && nr_running_ctxs) ||
-			(!exclusive && running_exclusive_ctxs)) {
+	if (nr_running_ctxs) {
 		mutex_unlock(&damon_lock);
 		return -EBUSY;
 	}
@@ -468,15 +427,13 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 			break;
 		nr_running_ctxs++;
 	}
-	if (exclusive && nr_running_ctxs)
-			running_exclusive_ctxs = true;
 	mutex_unlock(&damon_lock);
 
 	return err;
 }
 
 /*
- * __damon_stop() - Stops monitoring of a given context.
+ * __damon_stop() - Stops monitoring of given context.
  * @ctx:	monitoring context
  *
  * Return: 0 on success, negative error code otherwise.
@@ -514,7 +471,7 @@ int damon_stop(struct damon_ctx **ctxs, int nr_ctxs)
 		/* nr_running_ctxs is decremented in kdamond_fn */
 		err = __damon_stop(ctxs[i]);
 		if (err)
-			break;
+			return err;
 	}
 
 	return err;
@@ -592,10 +549,10 @@ static bool damos_valid_target(struct damon_ctx *c, struct damon_target *t,
 {
 	bool ret = __damos_valid_target(r, s);
 
-	if (!ret || !s->quota.esz || !c->ops.get_scheme_score)
+	if (!ret || !s->quota.esz || !c->primitive.get_scheme_score)
 		return ret;
 
-	return c->ops.get_scheme_score(c, t, r, s) >= s->quota.min_score;
+	return c->primitive.get_scheme_score(c, t, r, s) >= s->quota.min_score;
 }
 
 static void damon_do_apply_schemes(struct damon_ctx *c,
@@ -652,7 +609,7 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 			continue;
 
 		/* Apply the scheme */
-		if (c->ops.apply_scheme) {
+		if (c->primitive.apply_scheme) {
 			if (quota->esz &&
 					quota->charged_sz + sz > quota->esz) {
 				sz = ALIGN_DOWN(quota->esz - quota->charged_sz,
@@ -662,7 +619,7 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 				damon_split_region_at(c, t, r, sz);
 			}
 			ktime_get_coarse_ts64(&begin);
-			sz_applied = c->ops.apply_scheme(c, t, r, s);
+			sz_applied = c->primitive.apply_scheme(c, t, r, s);
 			ktime_get_coarse_ts64(&end);
 			quota->total_charged_ns += timespec64_to_ns(&end) -
 				timespec64_to_ns(&begin);
@@ -736,7 +693,7 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
 			damos_set_effective_quota(quota);
 		}
 
-		if (!c->ops.get_scheme_score)
+		if (!c->primitive.get_scheme_score)
 			continue;
 
 		/* Fill up the score histogram */
@@ -745,7 +702,7 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
 			damon_for_each_region(r, t) {
 				if (!__damos_valid_target(r, s))
 					continue;
-				score = c->ops.get_scheme_score(
+				score = c->primitive.get_scheme_score(
 						c, t, r, s);
 				quota->histogram[score] +=
 					r->ar.end - r->ar.start;
@@ -921,7 +878,17 @@ static void kdamond_split_regions(struct damon_ctx *ctx)
 		damon_split_regions_of(ctx, t, nr_subregions);
 
 	last_nr_regions = nr_regions;
-	nr_damon_region = nr_regions;
+}
+
+/*
+ * Check whether it is time to check and apply the target monitoring regions
+ *
+ * Returns true if it is.
+ */
+static bool kdamond_need_update_primitive(struct damon_ctx *ctx)
+{
+	return damon_check_reset_time_interval(&ctx->last_primitive_update,
+			ctx->primitive_update_interval);
 }
 
 /*
@@ -939,24 +906,29 @@ static bool kdamond_need_stop(struct damon_ctx *ctx)
 	if (kthread_should_stop())
 		return true;
 
-	if (!ctx->ops.target_valid)
+	if (!ctx->primitive.target_valid)
 		return false;
 
 	damon_for_each_target(t, ctx) {
-		if (ctx->ops.target_valid(t))
+		if (ctx->primitive.target_valid(t))
 			return false;
 	}
 
 	return true;
 }
 
-static void kdamond_usleep(unsigned long usecs)
+static unsigned long damos_wmark_metric_value(enum damos_wmark_metric metric)
 {
-	/* See Documentation/timers/timers-howto.rst for the thresholds */
-	if (usecs > 20 * USEC_PER_MSEC)
-		schedule_timeout_idle(usecs_to_jiffies(usecs));
-	else
-		usleep_idle_range(usecs, usecs + 1);
+	struct sysinfo i;
+
+	switch (metric) {
+	case DAMOS_WMARK_FREE_MEM_RATE:
+		si_meminfo(&i);
+		return i.freeram * 1000 / i.totalram;
+	default:
+		break;
+	}
+	return -EINVAL;
 }
 
 /*
@@ -966,110 +938,40 @@ static void kdamond_usleep(unsigned long usecs)
 static unsigned long damos_wmark_wait_us(struct damos *scheme)
 {
 	unsigned long metric;
-	unsigned long diff;
-	struct sysinfo i;
 
-	switch (wmarks_metric)
-	{
-		case DAMOS_WMARK_NONE:
-			break;
+	if (scheme->wmarks.metric == DAMOS_WMARK_NONE)
+		return 0;
 
-		case DAMOS_WMARK_FREE_MEM_RATE:/* this case don't need break */
-		    si_meminfo(&i);
-			metric = i.freeram * 1000 / i.totalram;
-			/* higher than high watermark or lower than low watermark */
-		    if (metric > scheme->wmarks.high || scheme->wmarks.low > metric) {
-				if (scheme->wmarks.activated)
-					pr_debug("deactivate a scheme (%d) for %s wmark\n",
-							scheme->action,
-							metric > scheme->wmarks.high ?
-							"high" : "low");
-				scheme->wmarks.activated = false;
-				return scheme->wmarks.interval;
-			}
-
-			/* inactive and higher than middle watermark */
-			if ((scheme->wmarks.high >= metric && metric >= scheme->wmarks.mid) &&
-					!scheme->wmarks.activated)
-				return scheme->wmarks.interval;
-
-			if (!scheme->wmarks.activated)
-				pr_debug("activate a scheme (%d)\n", scheme->action);
-			scheme->wmarks.activated = true;
-			return 0;
-
-		case DAMOS_WMARK_OPLUS:/* this case don't need break */
-			si_meminfo(&i);
-			metric = i.freeram * 1000 / i.totalram;
-			diff   = abs(last_metric - metric);
-
-			if (scheme->wmarks.activated) {
-				if (metric < 10) {
-					scheme->wmarks.activated = false;
-					nr_reclaim_time = 0;
-					nr_reclaim_page = 0;
-					printk("[damon_reclaim] sleep. need kswapd.\n");
-					return scheme->wmarks.interval;
-				}
-				nr_reclaim_time = active_interval * active_cnt; // 10ms(0.01s) * cnt;
-			}
-
-			last_metric = (2*last_metric + 8*metric)/10; // smooth filter
-			/*
-			Total RAM     Activate FreeMem
-			-------------------------------
-				 4 GB               80 MB
-				 6 GB              120 MB
-				 8 GB              160 MB
-				12 GB              240 MB
-				16 GB              320 MB
-			*/
-			if (diff <= 20 || last_metric < metric) {
-
-				if (scheme->wmarks.activated) {
-					if (nr_reclaim_time >= 300000 ||  // time thresold: 5min = 5*60*1000 ms
-						nr_reclaim_page >= i.totalram * 20 / 1000 )
-					{
-						scheme->wmarks.activated = false;
-						nr_reclaim_time = 0;
-						nr_reclaim_page = 0;
-						printk("[damon_reclaim] sleep. need to control quota.\n");
-						return scheme->wmarks.interval;
-					} else {
-						++active_cnt;
-						return 0;
-					}
-				} else {
-					// nothing
-					return scheme->wmarks.interval;
-				}
-			}
-			else {
-				if (scheme->wmarks.activated) {
-					//nothing
-					return 0;
-				} else {
-					active_cnt = 0;
-					scheme->wmarks.activated = true;
-					nr_reclaim_time = 0;
-					nr_reclaim_page = 0;
-					printk("[damon_reclaim] active. \n");
-					kdamond_usleep(scheme->wmarks.interval);
-					return 0;
-				}
-			}
-
-		case DAMOS_WMARK_SLEEP:/* this case don't need break */
-			scheme->wmarks.activated = false;
-			nr_reclaim_time = 0;
-			nr_reclaim_page = 0;
-			printk("[damon_reclaim] sleep. call from upper layer.\n");
-			return scheme->wmarks.interval;
-
-		default:
-			break;
+	metric = damos_wmark_metric_value(scheme->wmarks.metric);
+	/* higher than high watermark or lower than low watermark */
+	if (metric > scheme->wmarks.high || scheme->wmarks.low > metric) {
+		if (scheme->wmarks.activated)
+			pr_debug("deactivate a scheme (%d) for %s wmark\n",
+					scheme->action,
+					metric > scheme->wmarks.high ?
+					"high" : "low");
+		scheme->wmarks.activated = false;
+		return scheme->wmarks.interval;
 	}
+
+	/* inactive and higher than middle watermark */
+	if ((scheme->wmarks.high >= metric && metric >= scheme->wmarks.mid) &&
+			!scheme->wmarks.activated)
+		return scheme->wmarks.interval;
+
+	if (!scheme->wmarks.activated)
+		pr_debug("activate a scheme (%d)\n", scheme->action);
+	scheme->wmarks.activated = true;
 	return 0;
+}
+
+static void kdamond_usleep(unsigned long usecs)
+{
+	/* See Documentation/timers/timers-howto.rst for the thresholds */
+	if (usecs > 20 * USEC_PER_MSEC)
+		schedule_timeout_idle(usecs_to_jiffies(usecs));
+	else
+		usleep_idle_range(usecs, usecs + 1);
 }
 
 /* Returns negative error code if it's not activated but should return */
@@ -1107,32 +1009,27 @@ static int kdamond_fn(void *data)
 
 	pr_debug("kdamond (%d) starts\n", current->pid);
 
-	if (ctx->ops.init)
-		ctx->ops.init(ctx);
+	if (ctx->primitive.init)
+		ctx->primitive.init(ctx);
 	if (ctx->callback.before_start && ctx->callback.before_start(ctx))
 		done = true;
 
 	sz_limit = damon_region_sz_limit(ctx);
 
-	last_metric = 0;
-	active_interval = ctx->sample_interval / 1000;
-	active_cnt = 0;
-	nr_reclaim_page = 0;
-
 	while (!kdamond_need_stop(ctx) && !done) {
 		if (kdamond_wait_activation(ctx))
 			continue;
 
-		if (ctx->ops.prepare_access_checks)
-			ctx->ops.prepare_access_checks(ctx);
+		if (ctx->primitive.prepare_access_checks)
+			ctx->primitive.prepare_access_checks(ctx);
 		if (ctx->callback.after_sampling &&
 				ctx->callback.after_sampling(ctx))
 			done = true;
 
 		kdamond_usleep(ctx->sample_interval);
 
-		if (ctx->ops.check_accesses)
-			max_nr_accesses = ctx->ops.check_accesses(ctx);
+		if (ctx->primitive.check_accesses)
+			max_nr_accesses = ctx->primitive.check_accesses(ctx);
 
 		if (kdamond_aggregate_interval_passed(ctx)) {
 			kdamond_merge_regions(ctx,
@@ -1144,9 +1041,13 @@ static int kdamond_fn(void *data)
 			kdamond_apply_schemes(ctx);
 			kdamond_reset_aggregated(ctx);
 			kdamond_split_regions(ctx);
-			if (ctx->ops.reset_aggregated)
-					ctx->ops.reset_aggregated(ctx);
+			if (ctx->primitive.reset_aggregated)
+				ctx->primitive.reset_aggregated(ctx);
+		}
 
+		if (kdamond_need_update_primitive(ctx)) {
+			if (ctx->primitive.update)
+				ctx->primitive.update(ctx);
 			sz_limit = damon_region_sz_limit(ctx);
 		}
 	}
@@ -1157,8 +1058,8 @@ static int kdamond_fn(void *data)
 
 	if (ctx->callback.before_terminate)
 		ctx->callback.before_terminate(ctx);
-	if (ctx->ops.cleanup)
-		ctx->ops.cleanup(ctx);
+	if (ctx->primitive.cleanup)
+		ctx->primitive.cleanup(ctx);
 
 	pr_debug("kdamond (%d) finishes\n", current->pid);
 	mutex_lock(&ctx->kdamond_lock);
@@ -1167,9 +1068,9 @@ static int kdamond_fn(void *data)
 
 	mutex_lock(&damon_lock);
 	nr_running_ctxs--;
-	if (!nr_running_ctxs && running_exclusive_ctxs)
-			running_exclusive_ctxs = false;
 	mutex_unlock(&damon_lock);
 
 	return 0;
 }
+
+#include "core-test.h"

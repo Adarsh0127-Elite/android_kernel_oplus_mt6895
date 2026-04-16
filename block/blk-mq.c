@@ -1868,6 +1868,12 @@ void blk_mq_start_stopped_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 		return;
 
 	clear_bit(BLK_MQ_S_STOPPED, &hctx->state);
+	/*
+	 * Pairs with the smp_mb() in blk_mq_hctx_stopped() to order the
+	 * clearing of BLK_MQ_S_STOPPED above and the checking of dispatch
+	 * list in the subsequent routine.
+	 */
+	smp_mb__after_atomic();
 	blk_mq_run_hw_queue(hctx, async);
 }
 EXPORT_SYMBOL_GPL(blk_mq_start_stopped_hw_queue);
@@ -4087,22 +4093,6 @@ unsigned int blk_mq_rq_cpu(struct request *rq)
 	return rq->mq_ctx->cpu;
 }
 EXPORT_SYMBOL(blk_mq_rq_cpu);
-
-#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
-const char *of_blk_feature_read(char *name)
-{
-	const char *value = NULL;
-
-	if (name) {
-		struct device_node *np = of_find_node_opts_by_path(BLK_MQ_DTS_PATH, NULL);
-		if (np) {
-			of_property_read_string(np, name, &value);
-		}
-	}
-
-	return value;
-}
-#endif
 
 static int __init blk_mq_init(void)
 {

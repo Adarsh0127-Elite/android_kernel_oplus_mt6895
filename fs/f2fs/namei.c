@@ -85,10 +85,7 @@ static struct inode *f2fs_new_inode(struct inode *dir, umode_t mode)
 
 	if (f2fs_sb_has_extra_attr(sbi)) {
 		set_inode_flag(inode, FI_EXTRA_ATTR);
-		if (sbi->oplus_feats & OPLUS_FEAT_DEDUP)
-			F2FS_I(inode)->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
-		else
-			F2FS_I(inode)->i_extra_isize = F2FS_LEGACY_EXTRA_ATTR_SIZE;
+		F2FS_I(inode)->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
 	}
 
 	if (test_opt(sbi, INLINE_XATTR))
@@ -159,7 +156,7 @@ fail_drop:
 }
 
 static inline int is_extension_exist(const unsigned char *s, const char *sub,
-						bool tmp_ext, bool tmp_dot)
+						bool tmp_ext)
 {
 	size_t slen = strlen(s);
 	size_t sublen = strlen(sub);
@@ -185,25 +182,11 @@ static inline int is_extension_exist(const unsigned char *s, const char *sub,
 	for (i = 1; i < slen - sublen; i++) {
 		if (s[i] != '.')
 			continue;
-		if (!strncasecmp(s + i + 1, sub, sublen)) {
-			if (!tmp_dot)
-				return 1;
-			if (i == slen - sublen - 1 || s[i + 1 + sublen] == '.')
-				return 1;
-		}
+		if (!strncasecmp(s + i + 1, sub, sublen))
+			return 1;
 	}
 
 	return 0;
-}
-
-static inline bool is_temperature_extension(const unsigned char *s, const char *sub)
-{
-	return is_extension_exist(s, sub, true, false);
-}
-
-static inline bool is_compress_extension(const unsigned char *s, const char *sub)
-{
-	return is_extension_exist(s, sub, true, true);
 }
 
 /*
@@ -221,7 +204,7 @@ static inline void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *
 	hot_count = sbi->raw_super->hot_ext_count;
 
 	for (i = 0; i < cold_count + hot_count; i++) {
-		if (is_temperature_extension(name, extlist[i]))
+		if (is_extension_exist(name, extlist[i], true))
 			break;
 	}
 
@@ -322,17 +305,19 @@ static void set_compress_inode(struct f2fs_sb_info *sbi, struct inode *inode,
 	hot_count = sbi->raw_super->hot_ext_count;
 
 	for (i = cold_count; i < cold_count + hot_count; i++) {
-		if (is_temperature_extension(name, extlist[i]))
-			goto up_read_out;
+		if (is_extension_exist(name, extlist[i], false)) {
+			f2fs_up_read(&sbi->sb_lock);
+			return;
+		}
 	}
+
+	f2fs_up_read(&sbi->sb_lock);
 
 	ext = F2FS_OPTION(sbi).extensions;
 
 	for (i = 0; i < ext_cnt; i++) {
-		if (!is_compress_extension(name, ext[i]))
+		if (!is_extension_exist(name, ext[i], false))
 			continue;
-
-		f2fs_up_read(&sbi->sb_lock);
 
 		/* Do not use inline_data with compression */
 		stat_dec_inline_inode(inode);
@@ -340,8 +325,6 @@ static void set_compress_inode(struct f2fs_sb_info *sbi, struct inode *inode,
 		set_compress_context(inode);
 		return;
 	}
-up_read_out:
-	f2fs_up_read(&sbi->sb_lock);
 }
 
 static int f2fs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
@@ -413,7 +396,7 @@ static int f2fs_link(struct dentry *old_dentry, struct inode *dir,
 
 	if (is_inode_flag_set(dir, FI_PROJ_INHERIT) &&
 			(!projid_eq(F2FS_I(dir)->i_projid,
-			F2FS_I(old_dentry->d_inode)->i_projid)))
+			F2FS_I(inode)->i_projid)))
 		return -EXDEV;
 
 	err = dquot_initialize(dir);
@@ -625,6 +608,15 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 		goto fail;
 	}
 
+	if (unlikely(inode->i_nlink == 0)) {
+		f2fs_warn(F2FS_I_SB(inode), "%s: inode (ino=%lx) has zero i_nlink",
+			  __func__, inode->i_ino);
+		err = -EFSCORRUPTED;
+		set_sbi_flag(F2FS_I_SB(inode), SBI_NEED_FSCK);
+		f2fs_put_page(page, 0);
+		goto fail;
+	}
+
 	f2fs_balance_fs(sbi, true);
 
 	f2fs_lock_op(sbi);
@@ -647,7 +639,6 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 	if (IS_CASEFOLDED(dir))
 		d_invalidate(dentry);
 #endif
-
 	if (IS_DIRSYNC(dir))
 		f2fs_sync_fs(sbi->sb, 1);
 fail:
@@ -954,7 +945,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	if (is_inode_flag_set(new_dir, FI_PROJ_INHERIT) &&
 			(!projid_eq(F2FS_I(new_dir)->i_projid,
-			F2FS_I(old_dentry->d_inode)->i_projid)))
+			F2FS_I(old_inode)->i_projid)))
 		return -EXDEV;
 
 	/*
@@ -1144,10 +1135,10 @@ static int f2fs_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	if ((is_inode_flag_set(new_dir, FI_PROJ_INHERIT) &&
 			!projid_eq(F2FS_I(new_dir)->i_projid,
-			F2FS_I(old_dentry->d_inode)->i_projid)) ||
-	    (is_inode_flag_set(new_dir, FI_PROJ_INHERIT) &&
+			F2FS_I(old_inode)->i_projid)) ||
+	    (is_inode_flag_set(old_dir, FI_PROJ_INHERIT) &&
 			!projid_eq(F2FS_I(old_dir)->i_projid,
-			F2FS_I(new_dentry->d_inode)->i_projid)))
+			F2FS_I(new_inode)->i_projid)))
 		return -EXDEV;
 
 	err = dquot_initialize(old_dir);
@@ -1383,36 +1374,3 @@ const struct inode_operations f2fs_special_inode_operations = {
 	.set_acl	= f2fs_set_acl,
 	.listxattr	= f2fs_listxattr,
 };
-
-void f2fs_update_atime(struct inode *inode, bool oneshot)
-{
-#ifdef CONFIG_F2FS_FS_COMPRESSION_FIXED_OUTPUT
-	struct f2fs_inode_info *fi = F2FS_I(inode);
-
-	if (!f2fs_compressed_file(inode))
-		return;
-
-	if (!sb_start_write_trylock(inode->i_sb))
-		return;
-
-	if (!inode_trylock(inode))
-		goto out_unlock_sb;
-
-	if (IS_RDONLY(inode))
-		goto out_unlock_inode;
-
-	if (fi->i_compress_flag & COMPRESS_ATIME_MASK) {
-		struct timespec64 now;
-
-		if (oneshot)
-			fi->i_compress_flag &= ~COMPRESS_ATIME_MASK;
-		now = current_time(inode);
-		inode_update_time(inode, &now, S_ATIME);
-	}
-
-out_unlock_inode:
-	inode_unlock(inode);
-out_unlock_sb:
-	sb_end_write(inode->i_sb);
-#endif
-}

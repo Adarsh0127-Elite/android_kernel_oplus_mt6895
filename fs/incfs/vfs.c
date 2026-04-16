@@ -1956,7 +1956,7 @@ void incfs_kill_sb(struct super_block *sb)
 
 	pr_debug("incfs: unmount\n");
 
-        /*
+	/*
 	 * We must kill the super before freeing mi, since killing the super
 	 * triggers inode eviction, which triggers the final update of the
 	 * backing file, which uses certain information for mi

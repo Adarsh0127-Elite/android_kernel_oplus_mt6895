@@ -230,13 +230,20 @@ static __init int bdi_class_init(void)
 }
 postcore_initcall(bdi_class_init);
 
+static int bdi_init(struct backing_dev_info *bdi);
+
 static int __init default_bdi_init(void)
 {
+	int err;
+
 	bdi_wq = alloc_workqueue("writeback", WQ_MEM_RECLAIM | WQ_UNBOUND |
 				 WQ_SYSFS, 0);
 	if (!bdi_wq)
 		return -ENOMEM;
-	return 0;
+
+	err = bdi_init(&noop_backing_dev_info);
+
+	return err;
 }
 subsys_initcall(default_bdi_init);
 
@@ -713,7 +720,7 @@ static void cgwb_remove_from_bdi_list(struct bdi_writeback *wb)
 
 #endif	/* CONFIG_CGROUP_WRITEBACK */
 
-int bdi_init(struct backing_dev_info *bdi)
+static int bdi_init(struct backing_dev_info *bdi)
 {
 	int ret;
 

@@ -22,6 +22,7 @@
 #include <linux/swap.h>
 #include <linux/splice.h>
 #include <linux/sched.h>
+
 #include <trace/hooks/fuse.h>
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);

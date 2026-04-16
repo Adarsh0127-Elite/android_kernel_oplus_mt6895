@@ -1345,10 +1345,6 @@ has_user_cpuid_feature(const struct arm64_cpu_capabilities *entry, int scope)
 	return feature_matches(val, entry);
 }
 
-#if defined(CONFIG_FAKE_ASYM32_CPU)
-static cpumask_t fake_cpu_32bit_el0_mask;
-#endif
-
 static bool
 has_cpuid_feature(const struct arm64_cpu_capabilities *entry, int scope)
 {
@@ -1367,27 +1363,6 @@ const struct cpumask *system_32bit_el0_cpumask(void)
 	return cpu_possible_mask;
 }
 EXPORT_SYMBOL_GPL(system_32bit_el0_cpumask);
-
-#if defined(CONFIG_FAKE_ASYM32_CPU)
-static int __init parse_fake_cpu_32bit_el0_mask(char *str)
-{
-	int ret;
-	int i;
-	unsigned long val;
-
-	ret = kstrtoul(str, 16, &val);
-	if (ret)
-		return 0;
-
-	for (i = 0; i < sizeof(unsigned long) * 8; i++) {
-		if ((val >> i) & 0x1)
-			cpumask_set_cpu(i, &fake_cpu_32bit_el0_mask);
-	}
-
-	return 0;
-}
-early_param("fake_cpu_32bit_el0_mask", parse_fake_cpu_32bit_el0_mask);
-#endif
 
 static int __init parse_32bit_el0_param(char *str)
 {
@@ -1940,16 +1915,22 @@ static void bti_enable(const struct arm64_cpu_capabilities *__unused)
 #ifdef CONFIG_ARM64_MTE
 static void cpu_enable_mte(struct arm64_cpu_capabilities const *cap)
 {
+	static bool cleared_zero_page = false;
+
 	sysreg_clear_set(sctlr_el1, 0, SCTLR_ELx_ATA | SCTLR_EL1_ATA0);
 
 	mte_cpu_setup();
 
 	/*
 	 * Clear the tags in the zero page. This needs to be done via the
-	 * linear map which has the Tagged attribute.
+	 * linear map which has the Tagged attribute. Since this page is
+	 * always mapped as pte_special(), set_pte_at() will not attempt to
+	 * clear the tags or set PG_mte_tagged.
 	 */
-	if (!test_and_set_bit(PG_mte_tagged, &ZERO_PAGE(0)->flags))
+	if (!cleared_zero_page) {
+		cleared_zero_page = true;
 		mte_clear_page_tags(lm_alias(empty_zero_page));
+	}
 
 	kasan_init_hw_tags_cpu();
 }
@@ -3045,10 +3026,6 @@ static int enable_mismatched_32bit_el0(unsigned int cpu)
 	bool cpu_32bit = id_aa64pfr0_32bit_el0(info->reg_id_aa64pfr0);
 
 	if (cpu_32bit) {
-#if defined(CONFIG_FAKE_ASYM32_CPU)
-		if (!cpumask_test_cpu(cpu, &fake_cpu_32bit_el0_mask))
-			return 0;
-#endif
 		cpumask_set_cpu(cpu, cpu_32bit_el0_mask);
 		static_branch_enable_cpuslocked(&arm64_mismatched_32bit_el0);
 	}

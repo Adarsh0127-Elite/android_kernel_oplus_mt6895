@@ -37,15 +37,6 @@ EXPORT_SYMBOL_GPL(blk_queue_rq_timeout);
  */
 void blk_set_default_limits(struct queue_limits *lim)
 {
-#ifdef CONFIG_DEVICE_XCOPY
-	struct para_limit *limit = (struct para_limit *) lim->android_kabi_reserved1;
-
-	if (limit) {
-		limit->max_copy_blks = BLK_MAX_COPY_RANGE;
-		limit->min_copy_blks = 1;
-		limit->max_copy_entr = BLK_MAX_COPY_RANGE;
-	}
-#endif
 	lim->max_segments = BLK_MAX_SEGMENTS;
 	lim->max_discard_segments = 1;
 	lim->max_integrity_segments = 0;
@@ -509,20 +500,9 @@ static unsigned int blk_round_down_sectors(unsigned int sectors, unsigned int lb
 int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 		     sector_t start)
 {
-	unsigned int top, bottom, alignment, ret = 0;
-#ifdef CONFIG_DEVICE_XCOPY
-	struct para_limit *limit_b = (struct para_limit *) b->android_kabi_reserved1;
-	struct para_limit *limit_t = (struct para_limit *) t->android_kabi_reserved1;
+	unsigned int top, bottom, alignment;
+	int ret = 0;
 
-	if (limit_b && limit_t) {
-		limit_t->max_copy_blks = min_not_zero(limit_t->max_copy_blks,
-							limit_b->max_copy_blks);
-		limit_t->min_copy_blks = min_not_zero(limit_t->min_copy_blks,
-							limit_b->min_copy_blks);
-		limit_t->max_copy_entr = min_not_zero(limit_t->max_copy_entr,
-							limit_b->max_copy_entr);
-	}
-#endif
 	t->max_sectors = min_not_zero(t->max_sectors, b->max_sectors);
 	t->max_hw_sectors = min_not_zero(t->max_hw_sectors, b->max_hw_sectors);
 	t->max_dev_sectors = min_not_zero(t->max_dev_sectors, b->max_dev_sectors);
@@ -603,7 +583,7 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 	}
 
 	/* chunk_sectors a multiple of the physical block size? */
-	if ((t->chunk_sectors << 9) & (t->physical_block_size - 1)) {
+	if (t->chunk_sectors % (t->physical_block_size >> SECTOR_SHIFT)) {
 		t->chunk_sectors = 0;
 		t->misaligned = 1;
 		ret = -1;

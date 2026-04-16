@@ -58,10 +58,6 @@
 #include <trace/hooks/mm.h>
 #include <trace/hooks/vmscan.h>
 
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/mm.h>
-#include <trace/hooks/vmscan.h>
-
 #include "internal.h"
 
 int isolate_movable_page(struct page *page, isolate_mode_t mode)
@@ -308,9 +304,6 @@ void __migration_entry_wait(struct mm_struct *mm, pte_t *ptep,
 		goto out;
 
 	page = migration_entry_to_page(entry);
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-	CHP_BUG_ON(PageCont(page));
-#endif
 	page = compound_head(page);
 
 	/*
@@ -486,7 +479,6 @@ int migrate_page_move_mapping(struct address_space *mapping,
 		struct mem_cgroup *memcg;
 
 		memcg = page_memcg(page);
-		/* FIXME: chp lruvec no care! */
 		old_lruvec = mem_cgroup_lruvec(memcg, oldzone->zone_pgdat);
 		new_lruvec = mem_cgroup_lruvec(memcg, newzone->zone_pgdat);
 
@@ -619,8 +611,6 @@ void migrate_page_states(struct page *newpage, struct page *page)
 		SetPageChecked(newpage);
 	if (PageMappedToDisk(page))
 		SetPageMappedToDisk(newpage);
-	trace_android_vh_look_around_migrate_page(page, newpage);
-
 	trace_android_vh_look_around_migrate_page(page, newpage);
 
 	/* Move dirty on pages not done by migrate_page_move_mapping() */
@@ -1047,11 +1037,6 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 
 		lock_page(page);
 	}
-
-	/* for debugging, detect the migration of subpages */
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-	CHP_BUG_ON(PageCont(page));
-#endif
 
 	if (PageWriteback(page)) {
 		/*
@@ -3106,20 +3091,16 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 			newpage = page;
 		}
 
+		if (!is_zone_device_page(newpage))
+			lru_cache_add(newpage);
 		remove_migration_ptes(page, newpage, false);
 		unlock_page(page);
 
-		if (is_zone_device_page(page))
-			put_page(page);
-		else
-			putback_lru_page(page);
+		put_page(page);
 
 		if (newpage != page) {
 			unlock_page(newpage);
-			if (is_zone_device_page(newpage))
-				put_page(newpage);
-			else
-				putback_lru_page(newpage);
+			put_page(newpage);
 		}
 	}
 }

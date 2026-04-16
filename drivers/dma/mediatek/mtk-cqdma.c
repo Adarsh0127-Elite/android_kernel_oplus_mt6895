@@ -133,7 +133,6 @@ struct mtk_cqdma_vchan {
  * @clk:                    The clock that device internal is using
  * @dma_requests:           The number of VCs the device supports to
  * @dma_channels:           The number of PCs the device supports to
- * @dma_mask:               A mask for DMA capability
  * @vc:                     The pointer to all available VCs
  * @pc:                     The pointer to all the underlying PCs
  */
@@ -143,7 +142,6 @@ struct mtk_cqdma_device {
 
 	u32 dma_requests;
 	u32 dma_channels;
-	u32 dma_mask;
 	struct mtk_cqdma_vchan *vc;
 	struct mtk_cqdma_pchan **pc;
 };
@@ -423,15 +421,11 @@ static struct virt_dma_desc *mtk_cqdma_find_active_desc(struct dma_chan *c,
 {
 	struct mtk_cqdma_vchan *cvc = to_cqdma_vchan(c);
 	struct virt_dma_desc *vd;
-	unsigned long flags;
 
-	spin_lock_irqsave(&cvc->pc->lock, flags);
 	list_for_each_entry(vd, &cvc->pc->queue, node)
 		if (vd->tx.cookie == cookie) {
-			spin_unlock_irqrestore(&cvc->pc->lock, flags);
 			return vd;
 		}
-	spin_unlock_irqrestore(&cvc->pc->lock, flags);
 
 	list_for_each_entry(vd, &cvc->vc.desc_issued, node)
 		if (vd->tx.cookie == cookie)
@@ -455,9 +449,11 @@ static enum dma_status mtk_cqdma_tx_status(struct dma_chan *c,
 	if (ret == DMA_COMPLETE || !txstate)
 		return ret;
 
-	spin_lock_irqsave(&cvc->vc.lock, flags);
+	spin_lock_irqsave(&cvc->pc->lock, flags);
+	spin_lock(&cvc->vc.lock);
 	vd = mtk_cqdma_find_active_desc(c, cookie);
-	spin_unlock_irqrestore(&cvc->vc.lock, flags);
+	spin_unlock(&cvc->vc.lock);
+	spin_unlock_irqrestore(&cvc->pc->lock, flags);
 
 	if (vd) {
 		cvd = to_cqdma_vdesc(vd);
@@ -806,17 +802,6 @@ static int mtk_cqdma_probe(struct platform_device *pdev)
 		cqdma->dma_channels = MTK_CQDMA_NR_PCHANS;
 	}
 
-	if (pdev->dev.of_node && of_property_read_u32(pdev->dev.of_node,
-						      "dma-channel-mask",
-						      &cqdma->dma_mask)) {
-		dev_info(&pdev->dev,
-			"Using 0 as missing dma-channel-mask property\n");
-	} else {
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(cqdma->dma_mask));
-		if (err)
-			return err;
-	}
-
 	cqdma->pc = devm_kcalloc(&pdev->dev, cqdma->dma_channels,
 				 sizeof(*cqdma->pc), GFP_KERNEL);
 	if (!cqdma->pc)
@@ -910,12 +895,6 @@ static int mtk_cqdma_remove(struct platform_device *pdev)
 	unsigned long flags;
 	int i;
 
-	dma_async_device_unregister(&cqdma->ddev);
-	of_dma_controller_free(pdev->dev.of_node);
-
-	/* disable hardware */
-	mtk_cqdma_hw_deinit(cqdma);
-
 	/* kill VC task */
 	for (i = 0; i < cqdma->dma_requests; i++) {
 		vc = &cqdma->vc[i];
@@ -937,11 +916,11 @@ static int mtk_cqdma_remove(struct platform_device *pdev)
 		tasklet_kill(&cqdma->pc[i]->tasklet);
 	}
 
-	devm_kfree(&pdev->dev, cqdma->vc);
-	for (i = 0; i < cqdma->dma_channels; ++i)
-		devm_kfree(&pdev->dev, cqdma->pc[i]);
-	devm_kfree(&pdev->dev, cqdma->pc);
-	devm_kfree(&pdev->dev, cqdma);
+	/* disable hardware */
+	mtk_cqdma_hw_deinit(cqdma);
+
+	dma_async_device_unregister(&cqdma->ddev);
+	of_dma_controller_free(pdev->dev.of_node);
 
 	return 0;
 }

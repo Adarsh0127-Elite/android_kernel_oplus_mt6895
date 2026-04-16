@@ -174,7 +174,8 @@ static inline pmd_t set_pmd_bit(pmd_t pmd, pgprot_t prot)
 static inline pte_t pte_mkwrite(pte_t pte)
 {
 	pte = set_pte_bit(pte, __pgprot(PTE_WRITE));
-	pte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));
+	if (pte_sw_dirty(pte))
+		pte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));
 	return pte;
 }
 
@@ -303,10 +304,7 @@ static inline void __check_racy_pte_update(struct mm_struct *mm, pte_t *ptep,
 	 * (ptep_set_access_flags safely changes valid ptes without going
 	 * through an invalid entry).
 	 */
-	 /*
-	  * split cont_pte(remove cont bit in pte ) will not change page young
-	  */
-	VM_WARN_ONCE(!pte_young(pte) && !IS_ENABLED(CONFIG_CONT_PTE_HUGEPAGE),
+	VM_WARN_ONCE(!pte_young(pte),
 		     "%s: racy access flag clearing: 0x%016llx -> 0x%016llx",
 		     __func__, pte_val(old_pte), pte_val(pte));
 	VM_WARN_ONCE(pte_write(old_pte) && !pte_dirty(pte),
@@ -326,13 +324,6 @@ static inline void set_pte_at(struct mm_struct *mm, unsigned long addr,
 
 	__check_racy_pte_update(mm, ptep, pte);
 
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-#define UNALIGNED_CONT_PTE_WARN WARN_ON
-	/* 16 ptes of cont_pte should be set as a whole by copied cset_pte_at */
-	WARN_ON_ONCE((pte_cont(pte) || pte_cont(*ptep)) && current->mm);
-	UNALIGNED_CONT_PTE_WARN(pte_cont(pte) && ((pte_pfn(pte) & (CONT_PTES - 1)) !=
-			((unsigned long)ptep & (sizeof(pte) * CONT_PTES - 1)) / sizeof(pte)));
-#endif
 	set_pte(ptep, pte);
 }
 
@@ -628,7 +619,8 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 	pr_err("%s:%d: bad pmd %016llx.\n", __FILE__, __LINE__, pmd_val(e))
 
 #define pud_none(pud)		(!pud_val(pud))
-#define pud_bad(pud)		(!pud_table(pud))
+#define pud_bad(pud)		((pud_val(pud) & PUD_TYPE_MASK) != \
+				 PUD_TYPE_TABLE)
 #define pud_present(pud)	pte_present(pud_pte(pud))
 #define pud_leaf(pud)		(pud_present(pud) && !pud_table(pud))
 #define pud_valid(pud)		pte_valid(pud_pte(pud))
